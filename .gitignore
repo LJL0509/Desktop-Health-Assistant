@@ -8,3 +8,4 @@ data/
 logs/
 *.log
 models/*.task
+models/*.tflite

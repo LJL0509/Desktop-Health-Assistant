@@ -13,6 +13,7 @@ from mediapipe.tasks.python.core.base_options import BaseOptions
 from landmark_preview import (
     distance,
     draw_face,
+    next_video_timestamp_ms,
     open_camera,
     point,
 )
@@ -246,6 +247,7 @@ def main() -> None:
         raise RuntimeError("Could not open the camera with Media Foundation.")
 
     session_started = time.monotonic()
+    video_timestamp_ms = -1
     pending_label: str | None = None
     pending_started = 0.0
     active_label: str | None = None
@@ -267,7 +269,11 @@ def main() -> None:
                 frame = cv2.flip(frame, 1)
                 rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                timestamp_ms = int((time.monotonic() - session_started) * 1000)
+                video_timestamp_ms = next_video_timestamp_ms(
+                    time.monotonic() - session_started,
+                    video_timestamp_ms,
+                )
+                timestamp_ms = video_timestamp_ms
 
                 face_result = face_landmarker.detect_for_video(image, timestamp_ms)
                 pose_result = pose_landmarker.detect_for_video(image, timestamp_ms)

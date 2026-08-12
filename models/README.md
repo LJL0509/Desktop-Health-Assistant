@@ -4,3 +4,4 @@
 
 - Face Landmarker, float16, version 1
 - Pose Landmarker Lite, float16, version 1
+- Selfie Multiclass Image Segmenter, float32, 256 x 256

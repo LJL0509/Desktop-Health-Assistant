@@ -14,6 +14,11 @@ MODELS = {
         "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
         "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
     ),
+    "selfie_multiclass_256x256.tflite": (
+        "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+        "selfie_multiclass_256x256/float32/latest/"
+        "selfie_multiclass_256x256.tflite"
+    ),
 }
 
 

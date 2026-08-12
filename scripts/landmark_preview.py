@@ -19,6 +19,11 @@ RIGHT_EYE = (362, 385, 387, 263, 373, 380)
 FACE_POINTS = (1, 10, 33, 133, 152, 234, 263, 362, 454)
 
 
+def next_video_timestamp_ms(elapsed_seconds: float, previous_ms: int) -> int:
+    measured_ms = int(elapsed_seconds * 1000)
+    return max(measured_ms, previous_ms + 1)
+
+
 def open_camera() -> cv2.VideoCapture:
     camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -231,6 +236,7 @@ def main() -> None:
     camera = open_camera()
     paused = False
     started = time.monotonic()
+    video_timestamp_ms = -1
     previous_frame_time = started
     smoothed_fps = 0.0
 
@@ -254,7 +260,11 @@ def main() -> None:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         rgb = np.ascontiguousarray(rgb)
                         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                        timestamp_ms = int((time.monotonic() - started) * 1000)
+                        video_timestamp_ms = next_video_timestamp_ms(
+                            time.monotonic() - started,
+                            video_timestamp_ms,
+                        )
+                        timestamp_ms = video_timestamp_ms
 
                         face_result = face_landmarker.detect_for_video(image, timestamp_ms)
                         pose_result = pose_landmarker.detect_for_video(image, timestamp_ms)
