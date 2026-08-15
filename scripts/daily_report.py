@@ -5,12 +5,13 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Callable
 
+from app_paths import data_path
 
-ROOT = Path(__file__).resolve().parents[1]
-MONITOR_DIR = ROOT / "data" / "monitor-sessions"
-REMINDER_DIR = ROOT / "data" / "reminders"
-ACTIVITY_DIR = ROOT / "data" / "activity"
-REPORT_DIR = ROOT / "data" / "reports"
+
+MONITOR_DIR = data_path("monitor-sessions")
+REMINDER_DIR = data_path("reminders")
+ACTIVITY_DIR = data_path("activity")
+REPORT_DIR = data_path("reports")
 HYDRATION_INTERVAL_SECONDS = 60 * 60
 ISSUE_LABELS = {
     "neck_forward": "头部前伸",

@@ -1,4 +1,5 @@
 import ctypes
+import sys
 from ctypes import wintypes
 
 
@@ -54,6 +55,9 @@ def run_with_instance_lock(callback) -> int:
         with SingleInstanceLock():
             callback()
     except AlreadyRunningError:
-        print("Desktop Health Assistant 已经在运行，请勿重复启动。")
+        message = "桌面健康助手已经在运行，请检查系统托盘。"
+        print(message)
+        if getattr(sys, "frozen", False):
+            ctypes.windll.user32.MessageBoxW(None, message, "桌面健康助手", 0x40)
         return 2
     return 0

@@ -10,13 +10,13 @@ import numpy as np
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
+from app_paths import MODEL_ROOT, data_path
 from landmark_preview import draw_face, next_video_timestamp_ms, open_camera
 
 
-ROOT = Path(__file__).resolve().parents[1]
-FACE_MODEL = ROOT / "models" / "face_landmarker.task"
-SEGMENTER_MODEL = ROOT / "models" / "selfie_multiclass_256x256.tflite"
-DATA_DIR = ROOT / "data" / "upper-body-experiments"
+FACE_MODEL = MODEL_ROOT / "face_landmarker.task"
+SEGMENTER_MODEL = MODEL_ROOT / "selfie_multiclass_256x256.tflite"
+DATA_DIR = data_path("upper-body-experiments")
 WINDOW_NAME = "Desktop Health Assistant - Upper Body Contour Experiment"
 PERSON_CATEGORIES = (2, 4)
 HISTORY_SIZE = 90

@@ -7,5 +7,8 @@ __pycache__/
 data/
 logs/
 *.log
+build/
+dist/
+release/
 models/*.task
 models/*.tflite

@@ -1,0 +1,30 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 3, 0),
+    prodvers=(1, 0, 3, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'080404b0',
+        [
+          StringStruct(u'CompanyName', u'Desktop Health Assistant'),
+          StringStruct(u'FileDescription', u'桌面健康助手'),
+          StringStruct(u'FileVersion', u'1.0.3-preview'),
+          StringStruct(u'InternalName', u'DesktopHealthAssistant'),
+          StringStruct(u'LegalCopyright', u'Copyright (c) 2026'),
+          StringStruct(u'OriginalFilename', u'DesktopHealthAssistant.exe'),
+          StringStruct(u'ProductName', u'桌面健康助手'),
+          StringStruct(u'ProductVersion', u'1.0.3-preview')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
+  ]
+)

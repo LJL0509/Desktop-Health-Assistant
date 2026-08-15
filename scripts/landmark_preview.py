@@ -8,10 +8,11 @@ import numpy as np
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
+from app_paths import MODEL_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FACE_MODEL = PROJECT_ROOT / "models" / "face_landmarker.task"
-POSE_MODEL = PROJECT_ROOT / "models" / "pose_landmarker_lite.task"
+
+FACE_MODEL = MODEL_ROOT / "face_landmarker.task"
+POSE_MODEL = MODEL_ROOT / "pose_landmarker_lite.task"
 WINDOW_NAME = "Desktop Health Assistant - Landmark Check"
 
 LEFT_EYE = (33, 160, 158, 133, 153, 144)

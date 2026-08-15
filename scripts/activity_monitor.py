@@ -5,9 +5,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from app_paths import data_path
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data" / "activity"
+
+DATA_DIR = data_path("activity")
 DEFAULT_BREAK_RESET_MINUTES = 5
 
 

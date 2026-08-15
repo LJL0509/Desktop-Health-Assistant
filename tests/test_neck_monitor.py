@@ -3,6 +3,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -13,9 +14,16 @@ from neck_monitor import (  # noqa: E402
     classify_relative_motion,
     classify_posture,
     data_issue_message,
+    display_size_from_window_rect,
     IssueAccumulator,
+    resolve_visibility_mode,
     LatestFrameWorker,
+    PostureNotifier,
+    POSTURE_NOTIFICATION_TEXT,
+    point_in_rect,
+    scaled_ui_rect,
     target_posture_state,
+    WATER_BUTTON_RECT,
 )
 
 
@@ -95,6 +103,19 @@ class NeckMonitorClassificationTest(unittest.TestCase):
         )
         self.assertEqual(motion, "WHOLE BODY FORWARD")
 
+    def test_coordinated_forward_tolerates_small_ratio_boundary_noise(self) -> None:
+        motion = classify_relative_motion(
+            {
+                "face_growth": 0.165,
+                "torso_growth": 0.076,
+                "ratio_growth": 0.089,
+                "face_y_change": 0.023,
+                "torso_y_change": 0.0,
+                "torso_area_growth": -0.079,
+            }
+        )
+        self.assertEqual(motion, "WHOLE BODY FORWARD")
+
     def test_observed_small_contour_jitter_is_stable(self) -> None:
         motion = classify_relative_motion(
             {
@@ -169,19 +190,66 @@ class NeckMonitorClassificationTest(unittest.TestCase):
         self.assertEqual(state, "NECK NORMAL")
         self.assertEqual(motion, "WHOLE BODY BACK")
 
-    def test_forward_state_stays_latched_during_whole_body_motion(self) -> None:
+    def test_observed_farther_posture_is_not_rejected_for_small_torso_area(self) -> None:
+        motion = classify_relative_motion(
+            {
+                "face_growth": -0.276,
+                "torso_growth": -0.276,
+                "ratio_growth": 0.007,
+                "face_y_change": 0.152,
+                "torso_y_change": 0.046,
+                "torso_area_growth": -0.604,
+            }
+        )
+        self.assertEqual(motion, "WHOLE BODY BACK")
+
+    def test_observed_farther_posture_tolerates_ratio_segmentation_noise(self) -> None:
+        motion = classify_relative_motion(
+            {
+                "face_growth": -0.307,
+                "torso_growth": -0.350,
+                "ratio_growth": 0.069,
+                "face_y_change": 0.160,
+                "torso_y_change": 0.060,
+                "torso_area_growth": -0.505,
+            }
+        )
+        self.assertEqual(motion, "WHOLE BODY BACK")
+
+    def test_severe_contour_loss_with_relative_head_growth_stays_insufficient(self) -> None:
+        motion = classify_relative_motion(
+            {
+                "face_growth": -0.255,
+                "torso_growth": -0.353,
+                "ratio_growth": 0.146,
+                "face_y_change": 0.156,
+                "torso_y_change": 0.049,
+                "torso_area_growth": -0.642,
+            }
+        )
+        self.assertEqual(motion, "DATA INSUFFICIENT")
+
+    def test_whole_body_motion_clears_forward_state(self) -> None:
         features = {"ratio_growth": 0.12}
         state = target_posture_state(
             "NECK FORWARD",
             "WHOLE BODY FORWARD",
             features,
         )
-        self.assertEqual(state, "NECK FORWARD")
-
-    def test_forward_state_recovers_near_reference_ratio(self) -> None:
-        features = {"ratio_growth": 0.03}
-        state = target_posture_state("NECK FORWARD", "STABLE", features)
         self.assertEqual(state, "NECK NORMAL")
+
+    def test_reliable_motion_result_is_independent_of_previous_state(self) -> None:
+        features = {"ratio_growth": 0.12}
+        for previous in ("NECK NORMAL", "NECK FORWARD"):
+            with self.subTest(previous=previous):
+                self.assertEqual(
+                    target_posture_state(previous, "STABLE", features),
+                    "NECK NORMAL",
+                )
+                self.assertEqual(
+                    target_posture_state(previous, "HEAD FORWARD", features),
+                    "NECK FORWARD",
+                )
 
     def test_uncertain_data_does_not_clear_forward_state(self) -> None:
         features = {"ratio_growth": -0.10}
@@ -198,6 +266,46 @@ class NeckMonitorClassificationTest(unittest.TestCase):
         state, _, motion = assess_posture(BASELINE, current)
         self.assertEqual(state, "NECK NORMAL")
         self.assertEqual(motion, "DATA INSUFFICIENT")
+
+    def test_partial_view_keeps_strong_head_forward_evidence(self) -> None:
+        motion = classify_relative_motion(
+            {
+                "face_growth": 0.10,
+                "torso_growth": -0.20,
+                "ratio_growth": 0.39,
+                "face_y_change": 0.04,
+                "torso_y_change": 0.0,
+                "torso_area_growth": -0.74,
+            }
+        )
+        self.assertEqual(motion, "HEAD FORWARD")
+
+    def test_partial_view_treats_contour_loss_as_non_forward_when_evidence_is_weak(self) -> None:
+        motion = classify_relative_motion(
+            {
+                "face_growth": -0.04,
+                "torso_growth": -0.09,
+                "ratio_growth": 0.05,
+                "face_y_change": 0.01,
+                "torso_y_change": 0.0,
+                "torso_area_growth": -0.70,
+            },
+            partial_view=True,
+        )
+        self.assertEqual(motion, "STABLE")
+
+    def test_valid_non_forward_movement_is_stable(self) -> None:
+        motion = classify_relative_motion(
+            {
+                "face_growth": -0.05,
+                "torso_growth": 0.04,
+                "ratio_growth": -0.09,
+                "face_y_change": 0.07,
+                "torso_y_change": 0.0,
+                "torso_area_growth": -0.12,
+            }
+        )
+        self.assertEqual(motion, "STABLE")
 
     def test_builds_stable_contour_baseline(self) -> None:
         samples = [changed(face_width=0.25 + (index % 3 - 1) * 0.0005) for index in range(40)]
@@ -224,6 +332,22 @@ class NeckMonitorClassificationTest(unittest.TestCase):
 
 
 class IssueAccumulatorTest(unittest.TestCase):
+    def test_default_thresholds_are_per_issue(self) -> None:
+        neck = IssueAccumulator()
+        neck.update(0.0, "neck_forward")
+        self.assertEqual(neck.update(59.9, "neck_forward"), [])
+        self.assertEqual(
+            [event["event"] for event in neck.update(60.0, "neck_forward")],
+            ["posture_alert"],
+        )
+
+        low = IssueAccumulator()
+        low.update(0.0, "head_too_low")
+        self.assertEqual(low.update(179.9, "head_too_low"), [])
+        events = low.update(180.0, "head_too_low")
+        self.assertEqual([event["event"] for event in events], ["posture_alert"])
+        self.assertEqual(events[0]["threshold_seconds"], 180.0)
+
     def test_does_not_alert_before_continuous_threshold(self) -> None:
         tracker = IssueAccumulator(alert_seconds=10.0, recovery_grace_seconds=2.0)
         tracker.update(0.0, "neck_forward")
@@ -231,14 +355,41 @@ class IssueAccumulatorTest(unittest.TestCase):
         self.assertFalse(any(event["event"] == "posture_alert" for event in events))
         self.assertFalse(tracker.alerted)
 
-    def test_alerts_once_after_continuous_threshold(self) -> None:
+    def test_does_not_repeat_before_three_minutes(self) -> None:
         tracker = IssueAccumulator(alert_seconds=10.0, recovery_grace_seconds=2.0)
         tracker.update(0.0, "neck_forward")
         first = tracker.update(10.0, "neck_forward")
-        second = tracker.update(20.0, "neck_forward")
+        second = tracker.update(189.9, "neck_forward")
         self.assertEqual([event["event"] for event in first], ["posture_alert"])
         self.assertFalse(any(event["event"] == "posture_alert" for event in second))
         self.assertEqual(tracker.statistics["neck_forward"]["alert_count"], 1)
+
+    def test_repeats_after_three_minutes_then_every_ten_minutes(self) -> None:
+        tracker = IssueAccumulator(alert_seconds=10.0, recovery_grace_seconds=2.0)
+        tracker.update(0.0, "neck_forward")
+        tracker.update(10.0, "neck_forward")
+
+        second = tracker.update(190.0, "neck_forward")
+        before_third = tracker.update(789.9, "neck_forward")
+        third = tracker.update(790.0, "neck_forward")
+
+        self.assertTrue(second[0]["repeat"])
+        self.assertEqual(before_third, [])
+        self.assertTrue(third[0]["repeat"])
+        self.assertEqual(tracker.statistics["neck_forward"]["alert_count"], 3)
+
+    def test_recovery_resets_repeat_schedule(self) -> None:
+        tracker = IssueAccumulator(alert_seconds=10.0, recovery_grace_seconds=2.0)
+        tracker.update(0.0, "neck_forward")
+        tracker.update(10.0, "neck_forward")
+        tracker.update(13.0, None)
+
+        tracker.update(20.0, "neck_forward")
+        self.assertEqual(tracker.update(29.9, "neck_forward"), [])
+        events = tracker.update(30.0, "neck_forward")
+
+        self.assertEqual([event["event"] for event in events], ["posture_alert"])
+        self.assertFalse(events[0]["repeat"])
 
     def test_short_normal_jitter_does_not_split_episode(self) -> None:
         tracker = IssueAccumulator(alert_seconds=10.0, recovery_grace_seconds=2.0)
@@ -260,6 +411,123 @@ class IssueAccumulatorTest(unittest.TestCase):
         self.assertEqual(summary["total_seconds"], 12.0)
         self.assertEqual(summary["longest_seconds"], 12.0)
         self.assertEqual(summary["alert_count"], 1)
+
+
+class PostureNotifierTest(unittest.TestCase):
+    def test_has_distinct_behavior_guidance_for_each_issue(self) -> None:
+        self.assertIn("头部前倾", POSTURE_NOTIFICATION_TEXT["neck_forward"][1])
+        self.assertIn("抬高头部", POSTURE_NOTIFICATION_TEXT["head_too_low"][1])
+
+    def test_uses_shared_topmost_popup(self) -> None:
+        popup_notifier = Mock()
+        notifier = PostureNotifier(popup_notifier)
+        notifier.show("neck_forward")
+
+        popup_notifier.show.assert_called_once_with(
+            *POSTURE_NOTIFICATION_TEXT["neck_forward"],
+        )
+
+
+class VisibilityTransitionTest(unittest.TestCase):
+    def test_maps_usable_gap_between_low_and_partial_to_partial(self) -> None:
+        self.assertEqual(
+            resolve_visibility_mode(
+                "CONTOUR UNSTABLE",
+                "TOO LOW",
+                True,
+                True,
+                0.20,
+            ),
+            "PARTIAL",
+        )
+        self.assertEqual(
+            resolve_visibility_mode(
+                "CONTOUR UNSTABLE",
+                "PARTIAL",
+                True,
+                True,
+                0.20,
+            ),
+            "PARTIAL",
+        )
+
+    def test_data_loss_does_not_clear_too_low(self) -> None:
+        self.assertEqual(
+            resolve_visibility_mode(
+                "CONTOUR UNSTABLE",
+                "TOO LOW",
+                False,
+                True,
+                0.0,
+            ),
+            "TOO LOW",
+        )
+        self.assertEqual(
+            resolve_visibility_mode(
+                "CONTOUR UNSTABLE",
+                "TOO LOW",
+                True,
+                True,
+                0.17,
+            ),
+            "TOO LOW",
+        )
+
+    def test_partial_can_transition_directly_to_too_low(self) -> None:
+        self.assertEqual(
+            resolve_visibility_mode(
+                "CONTOUR UNSTABLE",
+                "PARTIAL",
+                True,
+                True,
+                0.14,
+            ),
+            "TOO LOW",
+        )
+
+    def test_gap_without_metrics_remains_insufficient(self) -> None:
+        self.assertEqual(
+            resolve_visibility_mode(
+                "CONTOUR UNSTABLE",
+                "PARTIAL",
+                False,
+                True,
+                0.0,
+            ),
+            "CONTOUR UNSTABLE",
+        )
+        self.assertEqual(
+            resolve_visibility_mode(
+                "CONTOUR UNSTABLE",
+                "FULL",
+                True,
+                False,
+                0.0,
+            ),
+            "CONTOUR UNSTABLE",
+        )
+
+
+class MonitorControlsTest(unittest.TestCase):
+    def test_water_button_hit_area_has_stable_bounds(self) -> None:
+        self.assertTrue(point_in_rect(500, 90, WATER_BUTTON_RECT))
+        self.assertFalse(point_in_rect(450, 90, WATER_BUTTON_RECT))
+
+    def test_water_button_hit_area_scales_with_display(self) -> None:
+        scaled = scaled_ui_rect(WATER_BUTTON_RECT, (2560, 1536))
+        self.assertEqual(scaled, (1880, 230, 2440, 336))
+        self.assertTrue(point_in_rect(2000, 280, scaled))
+        self.assertFalse(point_in_rect(500, 90, scaled))
+
+    def test_display_size_uses_valid_window_image_rect(self) -> None:
+        self.assertEqual(
+            display_size_from_window_rect((0, 30, 2560, 1536)),
+            (2560, 1536),
+        )
+        self.assertEqual(
+            display_size_from_window_rect((0, 0, 0, 0)),
+            (640, 480),
+        )
 
 
 class LatestFrameWorkerTest(unittest.TestCase):

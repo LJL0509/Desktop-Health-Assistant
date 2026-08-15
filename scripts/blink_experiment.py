@@ -13,6 +13,11 @@ from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
 from instance_lock import run_with_instance_lock
+from health_popup import (
+    FIRST_REPEAT_REMINDER_SECONDS,
+    HealthPopupNotifier,
+    ONGOING_REPEAT_REMINDER_SECONDS,
+)
 from landmark_preview import (
     FACE_MODEL,
     LEFT_EYE,
@@ -220,11 +225,15 @@ class BlinkRateMonitor:
         window_seconds: float = LOW_BLINK_WINDOW_SECONDS,
         low_rate_per_minute: float = LOW_BLINK_RATE_PER_MINUTE,
         recovery_rate_per_minute: float = BLINK_RATE_RECOVERY_PER_MINUTE,
+        first_repeat_seconds: float = FIRST_REPEAT_REMINDER_SECONDS,
+        repeat_seconds: float = ONGOING_REPEAT_REMINDER_SECONDS,
     ) -> None:
         if window_seconds <= 0:
             raise ValueError("window_seconds must be positive")
         if not 0 <= low_rate_per_minute < recovery_rate_per_minute:
             raise ValueError("recovery rate must be greater than low rate")
+        if first_repeat_seconds <= 0 or repeat_seconds <= 0:
+            raise ValueError("repeat reminder intervals must be positive")
         self.window_seconds = window_seconds
         self.low_rate_per_minute = low_rate_per_minute
         self.recovery_rate_per_minute = recovery_rate_per_minute
@@ -233,6 +242,24 @@ class BlinkRateMonitor:
         self.blink_times: deque[float] = deque()
         self.alerted = False
         self.alert_count = 0
+        self.first_repeat_seconds = first_repeat_seconds
+        self.repeat_seconds = repeat_seconds
+        self.next_alert_effective_time: float | None = None
+
+    def _alert_event(self, rate: float, repeat: bool) -> dict:
+        self.alerted = True
+        self.alert_count += 1
+        self.next_alert_effective_time = self.effective_time + (
+            self.repeat_seconds if repeat else self.first_repeat_seconds
+        )
+        return {
+            "event": "low_blink_rate_alert",
+            "rate_per_minute": rate,
+            "blink_count": len(self.blink_times),
+            "valid_observation_seconds": self.window_seconds,
+            "threshold_per_minute": self.low_rate_per_minute,
+            "repeat": repeat,
+        }
 
     def update(self, now: float, valid: bool, blink: bool = False) -> list[dict]:
         if self.last_updated_at is not None:
@@ -251,23 +278,22 @@ class BlinkRateMonitor:
 
         rate = self.rate_per_minute()
         if not self.alerted and rate < self.low_rate_per_minute:
-            self.alerted = True
-            self.alert_count += 1
-            return [{
-                "event": "low_blink_rate_alert",
-                "rate_per_minute": rate,
-                "blink_count": len(self.blink_times),
-                "valid_observation_seconds": self.window_seconds,
-                "threshold_per_minute": self.low_rate_per_minute,
-            }]
+            return [self._alert_event(rate, False)]
         if self.alerted and rate >= self.recovery_rate_per_minute:
             self.alerted = False
+            self.next_alert_effective_time = None
             return [{
                 "event": "low_blink_rate_recovered",
                 "rate_per_minute": rate,
                 "blink_count": len(self.blink_times),
                 "valid_observation_seconds": self.window_seconds,
             }]
+        if (
+            self.alerted
+            and self.next_alert_effective_time is not None
+            and self.effective_time >= self.next_alert_effective_time
+        ):
+            return [self._alert_event(rate, True)]
         return []
 
     def rate_per_minute(self) -> float | None:
@@ -278,22 +304,11 @@ class BlinkRateMonitor:
 
 
 class BlinkNotifier:
-    def __init__(self) -> None:
-        from windows_toasts import InteractableWindowsToaster
-
-        self.toaster = InteractableWindowsToaster("Desktop Health Assistant")
+    def __init__(self, notifier: HealthPopupNotifier | None = None) -> None:
+        self.notifier = notifier or HealthPopupNotifier()
 
     def show_low_blink_rate(self) -> None:
-        from windows_toasts import Toast, ToastAudio, ToastDuration, ToastScenario
-
-        self.toaster.show_toast(
-            Toast(
-                text_fields=[LOW_BLINK_TITLE, LOW_BLINK_MESSAGE],
-                audio=ToastAudio(silent=True),
-                duration=ToastDuration.Long,
-                scenario=ToastScenario.Reminder,
-            )
-        )
+        self.notifier.show(LOW_BLINK_TITLE, LOW_BLINK_MESSAGE)
 
 
 class ExperimentLog:

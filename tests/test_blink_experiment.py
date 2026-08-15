@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -8,8 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from blink_experiment import (  # noqa: E402
     BLINK_RATE_RECOVERY_PER_MINUTE,
     BlinkDetector,
+    BlinkNotifier,
     BlinkRateMonitor,
+    LOW_BLINK_MESSAGE,
     LOW_BLINK_RATE_PER_MINUTE,
+    LOW_BLINK_TITLE,
     build_open_eye_baseline,
     normalized_openness,
 )
@@ -133,6 +137,65 @@ class BlinkRateMonitorTest(unittest.TestCase):
         self.assertEqual(
             [event["event"] for event in events],
             ["low_blink_rate_recovered"],
+        )
+
+    def test_repeats_after_three_then_ten_effective_minutes(self) -> None:
+        monitor = BlinkRateMonitor(
+            window_seconds=10,
+            low_rate_per_minute=6,
+            recovery_rate_per_minute=8,
+        )
+        monitor.update(0, True)
+        first = []
+        for timestamp in range(1, 11):
+            first.extend(monitor.update(timestamp, True))
+        before_second = []
+        for timestamp in range(11, 190):
+            before_second.extend(monitor.update(timestamp, True))
+        second_alert = monitor.update(190, True)
+        before_third = []
+        for timestamp in range(191, 790):
+            before_third.extend(monitor.update(timestamp, True))
+        third = monitor.update(790, True)
+
+        self.assertFalse(first[0]["repeat"])
+        self.assertEqual(before_second, [])
+        self.assertTrue(second_alert[0]["repeat"])
+        self.assertEqual(before_third, [])
+        self.assertTrue(third[0]["repeat"])
+        self.assertEqual(monitor.alert_count, 3)
+
+    def test_missing_face_pauses_repeat_countdown(self) -> None:
+        monitor = BlinkRateMonitor(
+            window_seconds=10,
+            low_rate_per_minute=6,
+            recovery_rate_per_minute=8,
+            first_repeat_seconds=3,
+            repeat_seconds=10,
+        )
+        monitor.update(0, True)
+        for second in range(1, 11):
+            monitor.update(second, True)
+
+        self.assertEqual(monitor.update(100, False), [])
+        self.assertEqual(monitor.update(101, True), [])
+        self.assertEqual(monitor.update(102, True), [])
+        repeated = monitor.update(103, True)
+
+        self.assertEqual([event["event"] for event in repeated], ["low_blink_rate_alert"])
+        self.assertTrue(repeated[0]["repeat"])
+
+
+class BlinkNotifierTest(unittest.TestCase):
+    def test_uses_shared_topmost_popup(self) -> None:
+        popup_notifier = Mock()
+        notifier = BlinkNotifier(popup_notifier)
+
+        notifier.show_low_blink_rate()
+
+        popup_notifier.show.assert_called_once_with(
+            LOW_BLINK_TITLE,
+            LOW_BLINK_MESSAGE,
         )
 
 

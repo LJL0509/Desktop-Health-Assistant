@@ -1,9 +1,11 @@
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -11,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from reminder_service import (  # noqa: E402
     HYDRATION_MESSAGE,
     ReminderScheduler,
+    ReminderService,
     ReminderState,
     ReminderStore,
     SLEEP_MESSAGE,
@@ -99,6 +102,27 @@ class ReminderStoreTest(unittest.TestCase):
             store.save(ReminderState(last_water_at=at(9, 30)))
             payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(payload["last_water_at"], "2026-08-11T09:30:00+08:00")
+
+
+class ReminderServiceControlTest(unittest.TestCase):
+    def test_consumes_tray_water_request_through_official_service(self) -> None:
+        scheduler = ReminderScheduler(at(9))
+        store = Mock()
+        service = ReminderService.__new__(ReminderService)
+        service.scheduler = scheduler
+        service.store = store
+        service.lock = threading.Lock()
+        service.notifier = Mock()
+        control = Mock()
+        control.consume_water_requests.return_value = [250]
+
+        amounts = service.consume_water_requests(control, at(9, 20))
+
+        self.assertEqual(amounts, [250])
+        self.assertEqual(scheduler.state.last_water_at, at(9, 20))
+        store.save.assert_called_once_with(scheduler.state)
+        store.log.assert_called_once_with("water_recorded", at(9, 20), amount_ml=250)
+        control.update_hydration_status.assert_called_once()
 
 
 class WindowsNotifierTest(unittest.TestCase):

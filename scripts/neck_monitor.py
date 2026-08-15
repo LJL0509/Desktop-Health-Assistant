@@ -3,6 +3,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -11,8 +12,10 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
+from PIL import Image, ImageDraw, ImageFont
 
 from activity_monitor import ActivityMonitorService, ContinuousUseTracker
+from app_paths import app_version, data_path
 from blink_experiment import (
     BlinkDetector,
     BlinkNotifier,
@@ -22,6 +25,11 @@ from blink_experiment import (
     normalized_openness,
 )
 from daily_report import AutoReportScheduler
+from health_popup import (
+    FIRST_REPEAT_REMINDER_SECONDS,
+    HealthPopupNotifier,
+    ONGOING_REPEAT_REMINDER_SECONDS,
+)
 from instance_lock import run_with_instance_lock
 from landmark_preview import draw_face, next_video_timestamp_ms, open_camera
 from reminder_service import (
@@ -30,7 +38,11 @@ from reminder_service import (
     ReminderService,
     ReminderStore,
 )
-from tray_control import set_native_window_visible
+from tray_control import (
+    format_elapsed_time,
+    hydration_elapsed_seconds,
+    set_native_window_visible,
+)
 from upper_body_contour_experiment import (
     FACE_MODEL,
     SEGMENTER_MODEL,
@@ -40,9 +52,9 @@ from upper_body_contour_experiment import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data" / "monitor-sessions"
-WINDOW_NAME = "Desktop Health Assistant - Neck Monitor v1.0.0"
+APP_VERSION = app_version()
+DATA_DIR = data_path("monitor-sessions")
+WINDOW_NAME = f"Desktop Health Assistant - Neck Monitor v{APP_VERSION}"
 CALIBRATION_SECONDS = 10.0
 MAX_CALIBRATION_SECONDS = 20.0
 MIN_INTEGRATED_CALIBRATION_SAMPLES = 30
@@ -51,14 +63,208 @@ PREPARE_SECONDS = 3.0
 STATE_CONFIRM_SECONDS = 2.0
 DATA_ALERT_SECONDS = 10.0
 QUALITY_WINDOW_SIZE = 30
-RECOVERY_RATIO_GROWTH = 0.05
 POSTURE_ALERT_SECONDS = 60.0
+HEAD_TOO_LOW_ALERT_SECONDS = 3 * 60.0
 ISSUE_RECOVERY_GRACE_SECONDS = 3.0
 REMINDER_POLL_SECONDS = 1.0
+UI_FONT = Path("C:/Windows/Fonts/msyh.ttc")
+UI_FONT_BOLD = Path("C:/Windows/Fonts/msyhbd.ttc")
+WATER_BUTTON_RECT = (470, 72, 610, 105)
+UI_REFERENCE_SIZE = (640, 480)
 ISSUE_MESSAGES = {
     "neck_forward": "HEAD FORWARD FOR TOO LONG - RETURN TO A COMFORTABLE POSTURE",
     "head_too_low": "HEAD TOO LOW FOR TOO LONG - RAISE IT SLIGHTLY",
 }
+POSTURE_NOTIFICATION_TEXT = {
+    "neck_forward": (
+        "姿势提醒",
+        "头部前倾已经持续一段时间。请让头部回到躯干上方，活动一下再继续。",
+    ),
+    "head_too_low": (
+        "姿势提醒",
+        "低头姿势已经持续一段时间。请稍微抬高头部，并调整屏幕或阅读位置。",
+    ),
+}
+
+
+@lru_cache(maxsize=12)
+def ui_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    path = UI_FONT_BOLD if bold else UI_FONT
+    return ImageFont.truetype(str(path), size)
+
+
+@lru_cache(maxsize=512)
+def text_bitmap(
+    text: str,
+    size: int,
+    bold: bool,
+    color: tuple[int, int, int, int],
+) -> tuple[np.ndarray, tuple[int, int]]:
+    font = ui_font(size, bold)
+    left, top, right, bottom = font.getbbox(text)
+    image = Image.new("RGBA", (max(1, right - left), max(1, bottom - top)))
+    ImageDraw.Draw(image).text((-left, -top), text, font=font, fill=color)
+    return np.asarray(image), (left, top)
+
+
+def draw_ui_text(
+    frame: np.ndarray,
+    position: tuple[int, int],
+    text: str,
+    size: int,
+    color: tuple[int, int, int, int],
+    bold: bool = False,
+) -> None:
+    bitmap, offset = text_bitmap(text, size, bold, color)
+    x = position[0] + offset[0]
+    y = position[1] + offset[1]
+    height, width = bitmap.shape[:2]
+    frame_height, frame_width = frame.shape[:2]
+    source_left = max(0, -x)
+    source_top = max(0, -y)
+    source_right = min(width, frame_width - x)
+    source_bottom = min(height, frame_height - y)
+    if source_left >= source_right or source_top >= source_bottom:
+        return
+
+    target = frame[
+        y + source_top : y + source_bottom,
+        x + source_left : x + source_right,
+    ]
+    source = bitmap[source_top:source_bottom, source_left:source_right]
+    alpha = source[:, :, 3:4].astype(np.float32) / 255.0
+    source_bgr = source[:, :, :3][:, :, ::-1].astype(np.float32)
+    target[:] = (source_bgr * alpha + target * (1.0 - alpha)).astype(np.uint8)
+
+
+@lru_cache(maxsize=8)
+def solid_color_frame(
+    width: int,
+    height: int,
+    color: tuple[int, int, int],
+) -> np.ndarray:
+    frame = np.empty((height, width, 3), dtype=np.uint8)
+    frame[:] = color[::-1]
+    return frame
+
+
+@lru_cache(maxsize=16)
+def rounded_corner_restore_masks(radius: int) -> tuple[np.ndarray, ...]:
+    y, x = np.ogrid[:radius, :radius]
+    top_left = np.where(
+        (x - radius) ** 2 + (y - radius) ** 2 > radius**2,
+        255,
+        0,
+    ).astype(np.uint8)
+    return (
+        top_left,
+        np.fliplr(top_left),
+        np.flipud(top_left),
+        np.flip(top_left),
+    )
+
+
+def blend_rounded_rectangle(
+    frame: np.ndarray,
+    box: tuple[int, int, int, int],
+    radius: int,
+    color: tuple[int, int, int],
+    opacity: float,
+) -> None:
+    left, top, right, bottom = box
+    left = max(0, left)
+    top = max(0, top)
+    right = min(frame.shape[1], right)
+    bottom = min(frame.shape[0], bottom)
+    if left >= right or top >= bottom:
+        return
+
+    target = frame[top:bottom, left:right]
+    height, width = target.shape[:2]
+    radius = max(0, min(radius, width // 2, height // 2))
+    corners = ()
+    if radius:
+        corners = (
+            target[:radius, :radius].copy(),
+            target[:radius, -radius:].copy(),
+            target[-radius:, :radius].copy(),
+            target[-radius:, -radius:].copy(),
+        )
+
+    cv2.addWeighted(
+        solid_color_frame(width, height, color),
+        opacity,
+        target,
+        1.0 - opacity,
+        0,
+        dst=target,
+    )
+    if radius:
+        targets = (
+            target[:radius, :radius],
+            target[:radius, -radius:],
+            target[-radius:, :radius],
+            target[-radius:, -radius:],
+        )
+        for original, mask, corner in zip(
+            corners,
+            rounded_corner_restore_masks(radius),
+            targets,
+        ):
+            cv2.copyTo(original, mask, corner)
+
+
+def point_in_rect(x: int, y: int, rect: tuple[int, int, int, int]) -> bool:
+    left, top, right, bottom = rect
+    return left <= x <= right and top <= y <= bottom
+
+
+def scaled_ui_rect(
+    rect: tuple[int, int, int, int],
+    frame_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    width, height = frame_size
+    scale_x = width / UI_REFERENCE_SIZE[0]
+    scale_y = height / UI_REFERENCE_SIZE[1]
+    left, top, right, bottom = rect
+    return (
+        round(left * scale_x),
+        round(top * scale_y),
+        round(right * scale_x),
+        round(bottom * scale_y),
+    )
+
+
+def display_size_from_window_rect(
+    window_rect: tuple[int, int, int, int],
+    fallback: tuple[int, int] = UI_REFERENCE_SIZE,
+) -> tuple[int, int]:
+    width, height = window_rect[2:]
+    if width <= 0 or height <= 0:
+        return fallback
+    return width, height
+
+
+def current_display_size(
+    window_name: str,
+    fallback: tuple[int, int] = UI_REFERENCE_SIZE,
+) -> tuple[int, int]:
+    try:
+        return display_size_from_window_rect(
+            cv2.getWindowImageRect(window_name),
+            fallback,
+        )
+    except cv2.error:
+        return fallback
+
+
+class PostureNotifier:
+    def __init__(self, notifier: HealthPopupNotifier | None = None) -> None:
+        self.notifier = notifier or HealthPopupNotifier()
+
+    def show(self, issue: str) -> None:
+        title, message = POSTURE_NOTIFICATION_TEXT[issue]
+        self.notifier.show(title, message)
 
 
 class LatestFrameWorker:
@@ -205,7 +411,10 @@ def relative_features(reference: dict[str, float], current: dict[str, float]) ->
     }
 
 
-def classify_relative_motion(features: dict[str, float]) -> str:
+def classify_relative_motion(
+    features: dict[str, float],
+    partial_view: bool = False,
+) -> str:
     face_growth = features["face_growth"]
     torso_growth = features["torso_growth"]
     ratio_growth = features["ratio_growth"]
@@ -215,17 +424,32 @@ def classify_relative_motion(features: dict[str, float]) -> str:
     scale_difference = face_growth - torso_growth
     vertical_difference = face_y_change - torso_y_change
 
-    if torso_area_growth <= -0.60 or torso_growth <= -0.35:
-        return "DATA INSUFFICIENT"
+    coordinated_back = (
+        face_growth <= -0.06
+        and torso_growth <= -0.06
+        and ratio_growth <= 0.08
+    )
+    if coordinated_back:
+        return "WHOLE BODY BACK"
 
     motion = classify_motion(features)
+    partial_head_forward = motion == "HEAD FORWARD" and torso_growth > -0.30
+    if partial_head_forward:
+        return "HEAD FORWARD"
+
+    severe_contour_loss = torso_area_growth <= -0.60 or torso_growth <= -0.35
+    if severe_contour_loss and not partial_view:
+        return "DATA INSUFFICIENT"
+    if severe_contour_loss:
+        return "STABLE"
+
     if motion == "HEAD FORWARD":
         return motion
 
     coordinated_forward = (
         face_growth >= 0.08
         and torso_growth >= 0.07
-        and abs(ratio_growth) <= 0.08
+        and abs(ratio_growth) <= 0.10
     )
     if coordinated_forward:
         return "WHOLE BODY FORWARD"
@@ -258,8 +482,18 @@ def classify_relative_motion(features: dict[str, float]) -> str:
     if normal_jitter:
         return "STABLE"
 
-    if face_growth <= -0.06 and torso_growth <= -0.06 and abs(ratio_growth) <= 0.06:
-        return "WHOLE BODY BACK"
+    clear_non_forward = (
+        face_growth <= 0.05
+        or ratio_growth <= 0.05
+        or scale_difference <= 0.05
+        or (
+            vertical_difference < 0.015
+            and torso_area_growth > -0.12
+        )
+    )
+    if clear_non_forward:
+        return "STABLE"
+
     return motion
 
 
@@ -268,14 +502,10 @@ def target_posture_state(
     motion: str,
     features: dict[str, float],
 ) -> str:
-    if current_state == "NECK FORWARD":
-        recovered = (
-            motion in ("STABLE", "WHOLE BODY FORWARD", "WHOLE BODY BACK")
-            and features["ratio_growth"] <= RECOVERY_RATIO_GROWTH
-        )
-        return "NECK NORMAL" if recovered else "NECK FORWARD"
     if motion == "HEAD FORWARD":
         return "NECK FORWARD"
+    if motion in ("STABLE", "WHOLE BODY FORWARD", "WHOLE BODY BACK"):
+        return "NECK NORMAL"
     return current_state
 
 
@@ -283,9 +513,10 @@ def assess_posture(
     baseline: dict,
     current: dict[str, float],
     current_state: str = "NECK NORMAL",
+    partial_view: bool = False,
 ) -> tuple[str, dict[str, float], str]:
     features = relative_features(baseline["median"], current)
-    motion = classify_relative_motion(features)
+    motion = classify_relative_motion(features, partial_view=partial_view)
     state = target_posture_state(current_state, motion, features)
     return state, features, motion
 
@@ -305,18 +536,50 @@ def data_issue_message(reason: str) -> str:
     return "CAMERA DATA LOST - CHECK YOUR POSITION"
 
 
+def resolve_visibility_mode(
+    mode: str,
+    last_reliable_mode: str | None,
+    metrics_available: bool,
+    face_available: bool,
+    clearance_ratio: float,
+) -> str:
+    if mode != "CONTOUR UNSTABLE" or not face_available:
+        return mode
+    if metrics_available:
+        low_threshold = 0.18 if last_reliable_mode == "TOO LOW" else 0.15
+        if clearance_ratio < low_threshold:
+            return "TOO LOW"
+        if last_reliable_mode in ("PARTIAL", "TOO LOW"):
+            return "PARTIAL"
+    if last_reliable_mode == "TOO LOW":
+        return "TOO LOW"
+    return mode
+
+
 class IssueAccumulator:
     def __init__(
         self,
-        alert_seconds: float = POSTURE_ALERT_SECONDS,
+        alert_seconds: float | None = None,
         recovery_grace_seconds: float = ISSUE_RECOVERY_GRACE_SECONDS,
+        first_repeat_seconds: float = FIRST_REPEAT_REMINDER_SECONDS,
+        repeat_seconds: float = ONGOING_REPEAT_REMINDER_SECONDS,
     ) -> None:
-        self.alert_seconds = alert_seconds
+        self.alert_seconds_by_issue = {
+            "neck_forward": (
+                POSTURE_ALERT_SECONDS if alert_seconds is None else alert_seconds
+            ),
+            "head_too_low": (
+                HEAD_TOO_LOW_ALERT_SECONDS if alert_seconds is None else alert_seconds
+            ),
+        }
         self.recovery_grace_seconds = recovery_grace_seconds
+        self.first_repeat_seconds = first_repeat_seconds
+        self.repeat_seconds = repeat_seconds
         self.current_issue: str | None = None
         self.started_at = 0.0
         self.last_seen_at = 0.0
         self.alerted = False
+        self.next_alert_at: float | None = None
         self.statistics = {
             issue: {
                 "total_seconds": 0.0,
@@ -327,11 +590,18 @@ class IssueAccumulator:
             for issue in ISSUE_MESSAGES
         }
 
+    def alert_threshold(self, issue: str | None = None) -> float:
+        selected = issue or self.current_issue
+        if selected is None:
+            return POSTURE_ALERT_SECONDS
+        return self.alert_seconds_by_issue[selected]
+
     def _start(self, now: float, issue: str) -> dict:
         self.current_issue = issue
         self.started_at = now
         self.last_seen_at = now
         self.alerted = False
+        self.next_alert_at = None
         return {"event": "posture_issue_started", "issue": issue}
 
     def _close(self, ended_at: float) -> dict:
@@ -353,7 +623,25 @@ class IssueAccumulator:
         self.started_at = 0.0
         self.last_seen_at = 0.0
         self.alerted = False
+        self.next_alert_at = None
         return event
+
+    def _alert_event(self, now: float, duration: float, repeat: bool) -> dict:
+        issue = self.current_issue
+        if issue is None:
+            raise RuntimeError("Cannot alert when no posture issue is active")
+        self.alerted = True
+        self.statistics[issue]["alert_count"] += 1
+        self.next_alert_at = now + (
+            self.repeat_seconds if repeat else self.first_repeat_seconds
+        )
+        return {
+            "event": "posture_alert",
+            "issue": issue,
+            "duration_seconds": duration,
+            "threshold_seconds": self.alert_threshold(issue),
+            "repeat": repeat,
+        }
 
     def update(self, now: float, issue: str | None) -> list[dict]:
         events: list[dict] = []
@@ -373,17 +661,14 @@ class IssueAccumulator:
             return events
 
         duration = self.last_seen_at - self.started_at
-        if not self.alerted and duration >= self.alert_seconds:
-            self.alerted = True
-            self.statistics[self.current_issue]["alert_count"] += 1
-            events.append(
-                {
-                    "event": "posture_alert",
-                    "issue": self.current_issue,
-                    "duration_seconds": duration,
-                    "threshold_seconds": self.alert_seconds,
-                }
-            )
+        if not self.alerted and duration >= self.alert_threshold():
+            events.append(self._alert_event(self.last_seen_at, duration, False))
+        elif (
+            self.alerted
+            and self.next_alert_at is not None
+            and self.last_seen_at >= self.next_alert_at
+        ):
+            events.append(self._alert_event(self.last_seen_at, duration, True))
         return events
 
     def finish(self, now: float) -> list[dict]:
@@ -438,20 +723,61 @@ def draw_panel(
     data_alert: str,
     blink_count: int,
     blink_rate: float | None,
+    hydration_elapsed: float | None = None,
+    hydration_overdue: bool = False,
 ) -> None:
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (14, 14), (540, 324), (18, 22, 26), -1)
-    cv2.addWeighted(overlay, 0.86, frame, 0.14, 0, frame)
+    height, width = frame.shape[:2]
+    scale_x = width / UI_REFERENCE_SIZE[0]
+    scale_y = height / UI_REFERENCE_SIZE[1]
+    font_scale = min(scale_x, scale_y)
+
+    def xy(x: int, y: int) -> tuple[int, int]:
+        return round(x * scale_x), round(y * scale_y)
+
+    def rect(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        return scaled_ui_rect(box, (width, height))
+
+    def radius(value: int) -> int:
+        return max(1, round(value * font_scale))
+
+    def font_size(size: int) -> int:
+        return max(8, round(size * font_scale))
+
+    regular = font_size(13)
+    small = font_size(11)
+    value_font = font_size(12)
+    title_font = font_size(22)
+    button_font = font_size(12)
+
+    blend_rounded_rectangle(
+        frame,
+        rect((14, 14, 354, 330)),
+        radius(7),
+        (18, 22, 26),
+        224 / 255,
+    )
+    blend_rounded_rectangle(
+        frame,
+        rect((366, 14, 626, 116)),
+        radius(7),
+        (18, 22, 26),
+        232 / 255,
+    )
 
     state_color = {
-        "NECK NORMAL": (80, 220, 150),
-        "NECK FORWARD": (70, 110, 245),
-        "HEAD TOO LOW": (70, 110, 245),
-    }.get(state, (170, 178, 184))
-    cv2.putText(frame, state, (30, 48), cv2.FONT_HERSHEY_SIMPLEX,
-                0.76, state_color, 2, cv2.LINE_AA)
-    cv2.putText(frame, status, (30, 75), cv2.FONT_HERSHEY_SIMPLEX,
-                0.43, (165, 174, 182), 1, cv2.LINE_AA)
+        "NECK NORMAL": (80, 220, 150, 255),
+        "NECK FORWARD": (245, 110, 70, 255),
+        "HEAD TOO LOW": (245, 110, 70, 255),
+    }.get(state, (184, 190, 196, 255))
+    draw_ui_text(frame, xy(29, 28), state, title_font, state_color, bold=True)
+    compact_status = status if len(status) <= 44 else status[:41] + "..."
+    draw_ui_text(
+        frame,
+        xy(29, 61),
+        compact_status,
+        small,
+        (174, 182, 189, 255),
+    )
 
     rows = (
         ("MOTION", motion),
@@ -465,28 +791,96 @@ def draw_panel(
         ("BLINK RATE", "N/A" if blink_rate is None else f"{blink_rate:.1f} / min"),
     )
     for row, (label, value) in enumerate(rows):
-        y = 104 + row * 24
-        cv2.putText(frame, label, (30, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42, (150, 160, 168), 1, cv2.LINE_AA)
+        y = 91 + row * 25
+        draw_ui_text(frame, xy(29, y), label, small, (145, 155, 163, 255))
         if isinstance(value, str):
             text = value
         elif "GROWTH" in label:
             text = f"{value * 100:+.1f}%"
         else:
             text = f"{value:.4f}"
-        cv2.putText(frame, text, (250, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.46, (232, 234, 236), 1, cv2.LINE_AA)
+        draw_ui_text(
+            frame,
+            xy(215, y),
+            text,
+            value_font,
+            (234, 237, 239, 255),
+        )
 
-    cv2.putText(frame, "C calibrate   P pause   W water   Y/N feedback   Q quit",
-                (18, frame.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX,
-                0.42, (225, 228, 230), 1, cv2.LINE_AA)
+    hydration_color = (
+        (245, 166, 72, 255) if hydration_overdue else (88, 205, 157, 255)
+    )
+    draw_ui_text(
+        frame,
+        xy(382, 28),
+        "补水与休息",
+        regular,
+        (226, 231, 234, 255),
+    )
+    draw_ui_text(
+        frame,
+        xy(382, 51),
+        format_elapsed_time(hydration_elapsed),
+        button_font,
+        hydration_color,
+        bold=True,
+    )
+    blend_rounded_rectangle(
+        frame,
+        rect(WATER_BUTTON_RECT),
+        radius(5),
+        (200, 68, 85),
+        1.0,
+    )
+    draw_ui_text(
+        frame,
+        xy(489, 80),
+        "已补水 250 ml",
+        button_font,
+        (255, 255, 255, 255),
+        bold=True,
+    )
+
     if data_alert:
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (14, frame.shape[0] - 82),
-                      (frame.shape[1] - 14, frame.shape[0] - 42), (45, 55, 210), -1)
-        cv2.addWeighted(overlay, 0.88, frame, 0.12, 0, frame)
-        cv2.putText(frame, data_alert, (28, frame.shape[0] - 56),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.54, (245, 247, 248), 2, cv2.LINE_AA)
+        blend_rounded_rectangle(
+            frame,
+            rect((14, 398, 626, 438)),
+            radius(5),
+            (210, 55, 45),
+            232 / 255,
+        )
+        draw_ui_text(
+            frame,
+            xy(28, 407),
+            data_alert,
+            regular,
+            (248, 249, 250, 255),
+        )
+
+
+def draw_paused_message(frame: np.ndarray) -> None:
+    height, width = frame.shape[:2]
+    scale = min(width / UI_REFERENCE_SIZE[0], height / UI_REFERENCE_SIZE[1])
+    cv2.putText(
+        frame,
+        "CAMERA RELEASED",
+        (round(width * 0.29), round(height * 0.46)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9 * scale,
+        (80, 220, 150),
+        max(2, round(2 * scale)),
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        "Press P to resume",
+        (round(width * 0.35), round(height * 0.54)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55 * scale,
+        (175, 182, 188),
+        max(1, round(scale)),
+        cv2.LINE_AA,
+    )
 
 
 def main(control=None) -> None:
@@ -502,7 +896,7 @@ def main(control=None) -> None:
         output_face_blendshapes=True,
     )
     log = SessionLog()
-    log.write("session_started", monitor_version="1.0.0")
+    log.write("session_started", monitor_version=APP_VERSION)
     session_started = time.monotonic()
     video_started = session_started
     video_timestamp_ms = -1
@@ -517,6 +911,7 @@ def main(control=None) -> None:
     blink_detector = BlinkDetector()
     blink_rate_monitor = BlinkRateMonitor()
     blink_notifier = BlinkNotifier()
+    posture_notifier = PostureNotifier()
     blink_count = 0
     long_closure_count = 0
     long_closure_seconds = 0.0
@@ -537,6 +932,7 @@ def main(control=None) -> None:
     pending_since = 0.0
     mode = "CONTOUR UNSTABLE"
     previous_mode = mode
+    last_reliable_visibility_mode: str | None = None
     data_missing_since: float | None = None
     data_alert_logged = False
     data_alert = ""
@@ -552,7 +948,9 @@ def main(control=None) -> None:
         state=reminder_store.load(),
     )
     reminder_service = ReminderService(reminder_scheduler, reminder_store)
+    reminder_service.publish_hydration_status(control)
     activity_service = ActivityMonitorService()
+    water_button_requested = threading.Event()
     next_reminder_poll = 0.0
     next_report_poll = 0.0
     report_scheduler = AutoReportScheduler(datetime.now().astimezone())
@@ -612,7 +1010,7 @@ def main(control=None) -> None:
         log.write(
             "session_started",
             occurred_at=rollover_at,
-            monitor_version="1.0.0",
+            monitor_version=APP_VERSION,
             reason="day_rollover",
         )
         session_started = finished_at
@@ -644,6 +1042,18 @@ def main(control=None) -> None:
             raise RuntimeError("Could not open the camera with Media Foundation.")
         try:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW_NAME, 640, 480)
+            display_size = [640, 480]
+
+            def handle_mouse(event, x, y, _flags, _parameter) -> None:
+                if event == cv2.EVENT_LBUTTONUP and point_in_rect(
+                    x,
+                    y,
+                    scaled_ui_rect(WATER_BUTTON_RECT, tuple(display_size)),
+                ):
+                    water_button_requested.set()
+
+            cv2.setMouseCallback(WINDOW_NAME, handle_mouse)
             while True:
                 if control is not None:
                     control_state = control.snapshot()
@@ -674,7 +1084,23 @@ def main(control=None) -> None:
                 reminder_poll_now = time.monotonic()
                 if reminder_poll_now >= next_reminder_poll:
                     tick_at = datetime.now().astimezone()
+                    if water_button_requested.is_set():
+                        water_button_requested.clear()
+                        reminder_service.record_water(tick_at)
+                        log.write(
+                            "water_recorded_from_window",
+                            amount_ml=DEFAULT_WATER_ML,
+                        )
+                    for amount_ml in reminder_service.consume_water_requests(
+                        control,
+                        tick_at,
+                    ):
+                        log.write(
+                            "water_recorded_from_tray",
+                            amount_ml=amount_ml,
+                        )
                     reminder_service.tick(tick_at)
+                    reminder_service.publish_hydration_status(control)
                     if reminder_poll_now >= next_report_poll:
                         try:
                             generated_reports = report_scheduler.poll(
@@ -694,10 +1120,6 @@ def main(control=None) -> None:
                     next_reminder_poll = reminder_poll_now + REMINDER_POLL_SECONDS
                 if paused:
                     frame = np.full((480, 640, 3), (22, 26, 30), dtype=np.uint8)
-                    cv2.putText(frame, "CAMERA RELEASED", (185, 220),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 220, 150), 2, cv2.LINE_AA)
-                    cv2.putText(frame, "Press P to resume", (222, 258),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (175, 182, 188), 1, cv2.LINE_AA)
                 else:
                     ok, frame = camera.read()
                     if not ok:
@@ -740,20 +1162,28 @@ def main(control=None) -> None:
                         metrics, neck_mask = upper_body_metrics(category_mask, face)
                         if metrics:
                             clearance_ratio = metrics["head_clearance_ratio"]
-                        draw_face(frame, face)
 
                     quality_history.append((clearance_ratio, metrics is not None))
                     smooth_clearance = float(np.median([item[0] for item in quality_history]))
                     contour_fraction = float(np.mean([item[1] for item in quality_history]))
-                    mode = stabilized_visibility_mode(
+                    detected_mode = stabilized_visibility_mode(
                         previous_mode,
                         smooth_clearance,
                         contour_fraction,
+                    )
+                    mode = resolve_visibility_mode(
+                        detected_mode,
+                        last_reliable_visibility_mode,
+                        metrics is not None,
+                        face is not None,
+                        smooth_clearance,
                     )
                     if mode != previous_mode:
                         rolling.clear()
                         log.write("visibility_changed", previous=previous_mode, current=mode)
                         previous_mode = mode
+                    if mode in ("PARTIAL", "FULL", "TOO LOW"):
+                        last_reliable_visibility_mode = mode
 
                     valid = metrics is not None and mode in ("PARTIAL", "FULL")
                     if valid:
@@ -897,6 +1327,7 @@ def main(control=None) -> None:
                                 baseline,
                                 current_median,
                                 posture_state,
+                                partial_view=mode == "PARTIAL",
                             )
 
                             if raw_state == posture_state:
@@ -954,9 +1385,9 @@ def main(control=None) -> None:
                                     else "CHECKING RECOVERY"
                                 )
                                 status = f"Confirming {pending_state.lower()}"
-                            elif unreliable_motion and posture_state == "NECK NORMAL":
+                            elif unreliable_motion:
                                 display_state = "DATA INSUFFICIENT"
-                                status = "Posture signals conflict; healthy baseline unchanged"
+                                status = "Posture signals conflict; previous state is not displayed"
                             else:
                                 display_state = posture_state
                                 status = "Neck posture only; screen distance ignored"
@@ -1031,11 +1462,28 @@ def main(control=None) -> None:
                     if baseline and calibrating_since is None and preparing_since is None:
                         if display_state == "HEAD TOO LOW":
                             observed_issue = "head_too_low"
-                        elif valid and posture_state == "NECK FORWARD":
+                        elif (
+                            valid
+                            and posture_state == "NECK FORWARD"
+                            and motion not in ("UNCERTAIN", "DATA INSUFFICIENT")
+                        ):
                             observed_issue = "neck_forward"
                     for issue_event in issue_tracker.update(now, observed_issue):
                         event_name = issue_event.pop("event")
                         log.write(event_name, **issue_event)
+                        if event_name == "posture_alert":
+                            try:
+                                posture_notifier.show(issue_event["issue"])
+                                log.write(
+                                    "posture_popup_requested",
+                                    issue=issue_event["issue"],
+                                )
+                            except Exception as error:
+                                log.write(
+                                    "posture_popup_failed",
+                                    issue=issue_event["issue"],
+                                    message=str(error),
+                                )
 
                     if issue_tracker.current_issue and issue_tracker.alerted:
                         posture_alert = ISSUE_MESSAGES[issue_tracker.current_issue]
@@ -1045,7 +1493,7 @@ def main(control=None) -> None:
                         issue_seconds = issue_tracker.active_duration(now)
                         status = (
                             f"Observing posture: {issue_seconds:.0f}s / "
-                            f"{issue_tracker.alert_seconds:.0f}s before reminder"
+                            f"{issue_tracker.alert_threshold():.0f}s before reminder"
                         )
 
                     if display_state != last_display_state:
@@ -1062,8 +1510,33 @@ def main(control=None) -> None:
                     tint = np.zeros_like(frame)
                     tint[:, :, 1] = neck_mask
                     cv2.addWeighted(tint, 0.16, frame, 1.0, 0, frame)
-                    draw_panel(
+                    hydration_elapsed = (
+                        hydration_elapsed_seconds(control.snapshot())
+                        if control is not None
+                        else max(
+                            0.0,
+                            (
+                                datetime.now().astimezone()
+                                - (
+                                    reminder_scheduler.state.last_water_at
+                                    or reminder_scheduler.started_at
+                                )
+                            ).total_seconds(),
+                        )
+                    )
+                    display_size[:] = current_display_size(
+                        WINDOW_NAME,
+                        (frame.shape[1], frame.shape[0]),
+                    )
+                    display_frame = cv2.resize(
                         frame,
+                        tuple(display_size),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    if face is not None:
+                        draw_face(display_frame, face)
+                    draw_panel(
+                        display_frame,
                         display_state,
                         current_median,
                         features,
@@ -1073,7 +1546,26 @@ def main(control=None) -> None:
                         posture_alert or posture_data_alert or data_alert,
                         blink_count,
                         blink_rate_monitor.rate_per_minute(),
+                        hydration_elapsed=hydration_elapsed,
+                        hydration_overdue=(
+                            hydration_elapsed is not None
+                            and hydration_elapsed
+                            >= reminder_scheduler.hydration_interval.total_seconds()
+                        ),
                     )
+                    frame = display_frame
+
+                if paused:
+                    display_size[:] = current_display_size(
+                        WINDOW_NAME,
+                        (frame.shape[1], frame.shape[0]),
+                    )
+                    frame = cv2.resize(
+                        frame,
+                        tuple(display_size),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    draw_paused_message(frame)
 
                 cv2.imshow(WINDOW_NAME, frame)
                 key = cv2.waitKey(1) & 0xFF
@@ -1117,6 +1609,7 @@ def main(control=None) -> None:
                         control.set_camera_paused(paused)
                 if key == ord("w"):
                     reminder_service.record_water(datetime.now().astimezone())
+                    reminder_service.publish_hydration_status(control)
                     log.write(
                         "water_recorded_from_keyboard",
                         amount_ml=DEFAULT_WATER_ML,

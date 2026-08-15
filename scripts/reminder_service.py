@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Callable
 
 from activity_monitor import ActivityMonitorService, ContinuousUseTracker
+from app_paths import data_path
 from daily_report import AutoReportScheduler
 from instance_lock import run_with_instance_lock
 
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data" / "reminders"
+DATA_DIR = data_path("reminders")
 STATE_PATH = DATA_DIR / "state.json"
 APP_NAME = "Desktop Health Assistant"
 DEFAULT_HYDRATION_MINUTES = 60
@@ -275,6 +275,25 @@ class ReminderService:
                 self.notifier.show(event)
             return events
 
+    def publish_hydration_status(self, control) -> None:
+        if control is None:
+            return
+        control.update_hydration_status(
+            started_at=self.scheduler.started_at,
+            last_water_at=self.scheduler.state.last_water_at,
+            interval_seconds=self.scheduler.hydration_interval.total_seconds(),
+        )
+
+    def consume_water_requests(self, control, now: datetime) -> list[int]:
+        if control is None:
+            return []
+        amounts = control.consume_water_requests()
+        for amount_ml in amounts:
+            self.record_water(now, amount_ml)
+        if amounts:
+            self.publish_hydration_status(control)
+        return amounts
+
 
 def parse_sleep_time(value: str) -> clock_time:
     try:
@@ -326,6 +345,7 @@ def main(argv: list[str] | None = None, control=None) -> None:
         sleep_time=args.sleep_time,
     )
     service = ReminderService(scheduler, store)
+    service.publish_hydration_status(control)
 
     if args.record_water is not None:
         service.record_water(now, args.record_water)
@@ -414,7 +434,9 @@ def main(argv: list[str] | None = None, control=None) -> None:
                 print("Exit requested from system tray.")
                 break
             tick_at = datetime.now().astimezone()
+            service.consume_water_requests(control, tick_at)
             service.tick(tick_at)
+            service.publish_hydration_status(control)
             loop_now = time.monotonic()
             if loop_now >= next_report_poll:
                 try:
