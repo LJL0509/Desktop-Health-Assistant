@@ -1,5 +1,5 @@
 #define MyAppName "桌面健康助手"
-#define MyAppVersion "1.0.3-preview"
+#define MyAppVersion "1.0.3"
 #define MyAppPublisher "Desktop Health Assistant"
 #define MyAppExeName "DesktopHealthAssistant.exe"
 

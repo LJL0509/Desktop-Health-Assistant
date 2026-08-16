@@ -64,12 +64,14 @@ STATE_CONFIRM_SECONDS = 2.0
 DATA_ALERT_SECONDS = 10.0
 QUALITY_WINDOW_SIZE = 30
 POSTURE_ALERT_SECONDS = 60.0
-HEAD_TOO_LOW_ALERT_SECONDS = 3 * 60.0
+HEAD_TOO_LOW_ALERT_SECONDS = 60.0
 ISSUE_RECOVERY_GRACE_SECONDS = 3.0
 REMINDER_POLL_SECONDS = 1.0
 UI_FONT = Path("C:/Windows/Fonts/msyh.ttc")
 UI_FONT_BOLD = Path("C:/Windows/Fonts/msyhbd.ttc")
-WATER_BUTTON_RECT = (470, 72, 610, 105)
+HYDRATION_PANEL_RECT = (366, 350, 626, 466)
+WATER_BUTTON_RECT = (470, 408, 610, 451)
+DATA_ALERT_RECT = (14, 342, 354, 466)
 UI_REFERENCE_SIZE = (640, 480)
 ISSUE_MESSAGES = {
     "neck_forward": "HEAD FORWARD FOR TOO LONG - RETURN TO A COMFORTABLE POSTURE",
@@ -256,6 +258,28 @@ def current_display_size(
         )
     except cv2.error:
         return fallback
+
+
+def format_reminder_countdown(seconds: float) -> str:
+    remaining = max(0, int(np.ceil(seconds)))
+    minutes, seconds = divmod(remaining, 60)
+    return f"{minutes}m {seconds:02d}s"
+
+
+def wrap_ui_text(text: str, size: int, max_width: int) -> list[str]:
+    font = ui_font(size)
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}".strip()
+        if current and font.getlength(candidate) > max_width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 class PostureNotifier:
@@ -577,8 +601,10 @@ class IssueAccumulator:
         self.repeat_seconds = repeat_seconds
         self.current_issue: str | None = None
         self.started_at = 0.0
+        self.current_issue_started_at = 0.0
         self.last_seen_at = 0.0
         self.alerted = False
+        self.current_issue_alerted = False
         self.next_alert_at: float | None = None
         self.statistics = {
             issue: {
@@ -596,19 +622,24 @@ class IssueAccumulator:
             return POSTURE_ALERT_SECONDS
         return self.alert_seconds_by_issue[selected]
 
-    def _start(self, now: float, issue: str) -> dict:
+    def _begin_issue(self, now: float, issue: str) -> dict:
         self.current_issue = issue
-        self.started_at = now
+        self.current_issue_started_at = now
         self.last_seen_at = now
-        self.alerted = False
-        self.next_alert_at = None
+        self.current_issue_alerted = False
         return {"event": "posture_issue_started", "issue": issue}
 
-    def _close(self, ended_at: float) -> dict:
+    def _start(self, now: float, issue: str) -> dict:
+        self.started_at = now
+        self.alerted = False
+        self.next_alert_at = None
+        return self._begin_issue(now, issue)
+
+    def _end_current_issue(self, ended_at: float) -> dict:
         issue = self.current_issue
         if issue is None:
             raise RuntimeError("Cannot close a posture issue when none is active")
-        duration = max(0.0, ended_at - self.started_at)
+        duration = max(0.0, ended_at - self.current_issue_started_at)
         stats = self.statistics[issue]
         stats["total_seconds"] += duration
         stats["episode_count"] += 1
@@ -617,11 +648,17 @@ class IssueAccumulator:
             "event": "posture_issue_ended",
             "issue": issue,
             "duration_seconds": duration,
-            "alerted": self.alerted,
+            "alerted": self.current_issue_alerted,
         }
         self.current_issue = None
-        self.started_at = 0.0
+        self.current_issue_started_at = 0.0
         self.last_seen_at = 0.0
+        self.current_issue_alerted = False
+        return event
+
+    def _close(self, ended_at: float) -> dict:
+        event = self._end_current_issue(ended_at)
+        self.started_at = 0.0
         self.alerted = False
         self.next_alert_at = None
         return event
@@ -631,6 +668,7 @@ class IssueAccumulator:
         if issue is None:
             raise RuntimeError("Cannot alert when no posture issue is active")
         self.alerted = True
+        self.current_issue_alerted = True
         self.statistics[issue]["alert_count"] += 1
         self.next_alert_at = now + (
             self.repeat_seconds if repeat else self.first_repeat_seconds
@@ -653,9 +691,8 @@ class IssueAccumulator:
         if issue == self.current_issue:
             self.last_seen_at = now
         elif issue is not None:
-            events.append(self._close(self.last_seen_at))
-            events.append(self._start(now, issue))
-            return events
+            events.append(self._end_current_issue(now))
+            events.append(self._begin_issue(now, issue))
         elif now - self.last_seen_at >= self.recovery_grace_seconds:
             events.append(self._close(self.last_seen_at))
             return events
@@ -681,6 +718,11 @@ class IssueAccumulator:
         if self.current_issue is None:
             return 0.0
         return max(0.0, min(now, self.last_seen_at) - self.started_at)
+
+    def seconds_until_next_alert(self, now: float) -> float | None:
+        if not self.alerted or self.next_alert_at is None:
+            return None
+        return max(0.0, self.next_alert_at - now)
 
     def summary(self) -> dict[str, dict[str, float | int]]:
         return {
@@ -758,7 +800,7 @@ def draw_panel(
     )
     blend_rounded_rectangle(
         frame,
-        rect((366, 14, 626, 116)),
+        rect(HYDRATION_PANEL_RECT),
         radius(7),
         (18, 22, 26),
         232 / 255,
@@ -812,14 +854,14 @@ def draw_panel(
     )
     draw_ui_text(
         frame,
-        xy(382, 28),
+        xy(382, 364),
         "补水与休息",
         regular,
         (226, 231, 234, 255),
     )
     draw_ui_text(
         frame,
-        xy(382, 51),
+        xy(382, 390),
         format_elapsed_time(hydration_elapsed),
         button_font,
         hydration_color,
@@ -834,7 +876,7 @@ def draw_panel(
     )
     draw_ui_text(
         frame,
-        xy(489, 80),
+        xy(489, 419),
         "已补水 250 ml",
         button_font,
         (255, 255, 255, 255),
@@ -844,18 +886,20 @@ def draw_panel(
     if data_alert:
         blend_rounded_rectangle(
             frame,
-            rect((14, 398, 626, 438)),
+            rect(DATA_ALERT_RECT),
             radius(5),
             (210, 55, 45),
             232 / 255,
         )
-        draw_ui_text(
-            frame,
-            xy(28, 407),
-            data_alert,
-            regular,
-            (248, 249, 250, 255),
-        )
+        lines = wrap_ui_text(data_alert, regular, round(312 * scale_x))
+        for row, line in enumerate(lines[:4]):
+            draw_ui_text(
+                frame,
+                xy(28, 352 + row * 24),
+                line,
+                regular,
+                (248, 249, 250, 255),
+            )
 
 
 def draw_paused_message(frame: np.ndarray) -> None:
@@ -1487,6 +1531,12 @@ def main(control=None) -> None:
 
                     if issue_tracker.current_issue and issue_tracker.alerted:
                         posture_alert = ISSUE_MESSAGES[issue_tracker.current_issue]
+                        next_alert_seconds = issue_tracker.seconds_until_next_alert(now)
+                        if next_alert_seconds is not None:
+                            status = (
+                                "Next posture reminder in "
+                                f"{format_reminder_countdown(next_alert_seconds)}"
+                            )
                     else:
                         posture_alert = ""
                     if issue_tracker.current_issue and not issue_tracker.alerted:

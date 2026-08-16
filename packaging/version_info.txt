@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'Desktop Health Assistant'),
           StringStruct(u'FileDescription', u'桌面健康助手'),
-          StringStruct(u'FileVersion', u'1.0.3-preview'),
+          StringStruct(u'FileVersion', u'1.0.3'),
           StringStruct(u'InternalName', u'DesktopHealthAssistant'),
           StringStruct(u'LegalCopyright', u'Copyright (c) 2026'),
           StringStruct(u'OriginalFilename', u'DesktopHealthAssistant.exe'),
           StringStruct(u'ProductName', u'桌面健康助手'),
-          StringStruct(u'ProductVersion', u'1.0.3-preview')
+          StringStruct(u'ProductVersion', u'1.0.3')
         ]
       )
     ]),

@@ -15,6 +15,7 @@ from neck_monitor import (  # noqa: E402
     classify_posture,
     data_issue_message,
     display_size_from_window_rect,
+    format_reminder_countdown,
     IssueAccumulator,
     resolve_visibility_mode,
     LatestFrameWorker,
@@ -343,10 +344,10 @@ class IssueAccumulatorTest(unittest.TestCase):
 
         low = IssueAccumulator()
         low.update(0.0, "head_too_low")
-        self.assertEqual(low.update(179.9, "head_too_low"), [])
-        events = low.update(180.0, "head_too_low")
+        self.assertEqual(low.update(59.9, "head_too_low"), [])
+        events = low.update(60.0, "head_too_low")
         self.assertEqual([event["event"] for event in events], ["posture_alert"])
-        self.assertEqual(events[0]["threshold_seconds"], 180.0)
+        self.assertEqual(events[0]["threshold_seconds"], 60.0)
 
     def test_does_not_alert_before_continuous_threshold(self) -> None:
         tracker = IssueAccumulator(alert_seconds=10.0, recovery_grace_seconds=2.0)
@@ -390,6 +391,77 @@ class IssueAccumulatorTest(unittest.TestCase):
 
         self.assertEqual([event["event"] for event in events], ["posture_alert"])
         self.assertFalse(events[0]["repeat"])
+
+    def test_direct_issue_switch_keeps_continuous_alert_timer(self) -> None:
+        tracker = IssueAccumulator(alert_seconds=60.0, recovery_grace_seconds=2.0)
+        tracker.update(0.0, "neck_forward")
+        tracker.update(40.0, "neck_forward")
+        switch_events = tracker.update(40.0, "head_too_low")
+
+        self.assertEqual(
+            [event["event"] for event in switch_events],
+            ["posture_issue_ended", "posture_issue_started"],
+        )
+        alert_events = tracker.update(60.0, "head_too_low")
+        self.assertEqual([event["event"] for event in alert_events], ["posture_alert"])
+        self.assertEqual(alert_events[0]["issue"], "head_too_low")
+        self.assertEqual(alert_events[0]["duration_seconds"], 60.0)
+
+    def test_switch_at_threshold_alerts_for_new_issue(self) -> None:
+        tracker = IssueAccumulator(alert_seconds=60.0, recovery_grace_seconds=2.0)
+        tracker.update(0.0, "neck_forward")
+        tracker.update(59.0, "neck_forward")
+
+        events = tracker.update(60.0, "head_too_low")
+        alert = next(event for event in events if event["event"] == "posture_alert")
+
+        self.assertEqual(alert["issue"], "head_too_low")
+        self.assertEqual(alert["duration_seconds"], 60.0)
+
+    def test_switched_issues_keep_separate_report_durations(self) -> None:
+        tracker = IssueAccumulator(alert_seconds=60.0, recovery_grace_seconds=2.0)
+        tracker.update(0.0, "neck_forward")
+        tracker.update(40.0, "head_too_low")
+        tracker.update(70.0, "head_too_low")
+        tracker.update(72.0, None)
+
+        summary = tracker.summary()
+        self.assertEqual(summary["neck_forward"]["total_seconds"], 40.0)
+        self.assertEqual(summary["head_too_low"]["total_seconds"], 30.0)
+        self.assertEqual(summary["neck_forward"]["episode_count"], 1)
+        self.assertEqual(summary["head_too_low"]["episode_count"], 1)
+
+    def test_repeat_alert_uses_issue_active_when_repeat_is_due(self) -> None:
+        tracker = IssueAccumulator(
+            alert_seconds=10.0,
+            recovery_grace_seconds=2.0,
+            first_repeat_seconds=20.0,
+        )
+        tracker.update(0.0, "neck_forward")
+        tracker.update(10.0, "neck_forward")
+        tracker.update(20.0, "head_too_low")
+
+        events = tracker.update(30.0, "head_too_low")
+
+        self.assertEqual([event["event"] for event in events], ["posture_alert"])
+        self.assertEqual(events[0]["issue"], "head_too_low")
+        self.assertTrue(events[0]["repeat"])
+
+    def test_exposes_time_until_next_repeat_alert(self) -> None:
+        tracker = IssueAccumulator(
+            alert_seconds=10.0,
+            first_repeat_seconds=180.0,
+        )
+        tracker.update(0.0, "neck_forward")
+        tracker.update(10.0, "neck_forward")
+
+        self.assertEqual(tracker.seconds_until_next_alert(10.0), 180.0)
+        self.assertEqual(tracker.seconds_until_next_alert(70.5), 119.5)
+
+    def test_formats_repeat_countdown_for_display(self) -> None:
+        self.assertEqual(format_reminder_countdown(180.0), "3m 00s")
+        self.assertEqual(format_reminder_countdown(179.1), "3m 00s")
+        self.assertEqual(format_reminder_countdown(119.0), "1m 59s")
 
     def test_short_normal_jitter_does_not_split_episode(self) -> None:
         tracker = IssueAccumulator(alert_seconds=10.0, recovery_grace_seconds=2.0)
@@ -510,14 +582,14 @@ class VisibilityTransitionTest(unittest.TestCase):
 
 class MonitorControlsTest(unittest.TestCase):
     def test_water_button_hit_area_has_stable_bounds(self) -> None:
-        self.assertTrue(point_in_rect(500, 90, WATER_BUTTON_RECT))
-        self.assertFalse(point_in_rect(450, 90, WATER_BUTTON_RECT))
+        self.assertTrue(point_in_rect(500, 425, WATER_BUTTON_RECT))
+        self.assertFalse(point_in_rect(500, 90, WATER_BUTTON_RECT))
 
     def test_water_button_hit_area_scales_with_display(self) -> None:
         scaled = scaled_ui_rect(WATER_BUTTON_RECT, (2560, 1536))
-        self.assertEqual(scaled, (1880, 230, 2440, 336))
-        self.assertTrue(point_in_rect(2000, 280, scaled))
-        self.assertFalse(point_in_rect(500, 90, scaled))
+        self.assertEqual(scaled, (1880, 1306, 2440, 1443))
+        self.assertTrue(point_in_rect(2000, 1380, scaled))
+        self.assertFalse(point_in_rect(2000, 280, scaled))
 
     def test_display_size_uses_valid_window_image_rect(self) -> None:
         self.assertEqual(

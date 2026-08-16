@@ -2,9 +2,9 @@
 
 本地运行的桌面健康助手。项目使用摄像头和个人姿势校准，观察长期使用电脑时的脖子前伸状态。摄像头画面只在内存中处理，不保存、不上传。
 
-当前版本：`v1.0.2`，可直接分发的 Windows 版本。核心监测、提醒、日报、托盘控制和应用打包已经形成完整闭环。
+当前版本：`v1.0.3`，可直接分发的 Windows 版本。核心监测、提醒、日报、托盘控制和应用打包已经形成完整闭环。
 
-## v1.0.2 功能
+## v1.0.3 功能
 
 - 一次完成正常坐姿与睁眼基线的联合校准；
 - MediaPipe Face Landmarker 与 Image Segmenter；
@@ -41,10 +41,12 @@
 - 打包后模型与程序资源独立于源码目录，用户数据保存在 `%LOCALAPPDATA%\Desktop Health Assistant\data`。
 - 姿势和眨眼弹窗按实际内容自动调整高度，适配 Windows DPI 缩放；
 - 持续异常在首次提醒后 3 分钟再次提醒，此后每 10 分钟提醒，恢复正常后重置计时。
+- 头部前倾与头部过低无缝切换时延续异常计时，低头连续 60 秒后提醒；
+- 全屏游戏和浏览器视频中使用不抢焦点的分层置顶弹窗，不退出全屏或唤出任务栏。
 
 ## Windows 便携版
 
-解压 `release/DesktopHealthAssistant-Portable-1.0.2.zip` 后，双击 `DesktopHealthAssistant.exe`。必须保留同目录下的 `_internal` 文件夹。首次使用时允许摄像头权限，并按 `C` 完成个人正常姿势与睁眼基线校准。
+解压 `release/DesktopHealthAssistant-Portable-1.0.3.zip` 后，双击 `DesktopHealthAssistant.exe`。必须保留同目录下的 `_internal` 文件夹。首次使用时允许摄像头权限，并按 `C` 完成个人正常姿势与睁眼基线校准。
 
 程序未经代码签名，Windows SmartScreen 可能显示“未知发布者”。当前发布目标为 64 位 Windows 10/11。
 
@@ -77,6 +79,7 @@ python -m venv .venv
 
 - `start-camera.bat`：启动完整摄像头监测；
 - `start-no-camera.bat`：只启动提醒和连续使用统计。
+- `test-health-popup.bat`：等待 5 秒后测试全屏窗口中的健康提醒。
 
 生成当天健康报告：
 

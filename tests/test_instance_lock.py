@@ -33,6 +33,11 @@ class UnifiedLauncherParserTest(unittest.TestCase):
     def test_no_camera_mode_is_explicit(self) -> None:
         self.assertTrue(build_parser().parse_args(["--no-camera"]).no_camera)
 
+    def test_popup_test_mode_is_explicit(self) -> None:
+        self.assertTrue(
+            build_parser().parse_args(["--test-health-popup"]).test_health_popup
+        )
+
 
 class UnifiedLauncherTrayTest(unittest.TestCase):
     @staticmethod
@@ -77,6 +82,35 @@ class UnifiedLauncherTrayTest(unittest.TestCase):
         tray_type.return_value.stop.assert_called_once_with()
         control = reminder_main.call_args.kwargs["control"]
         self.assertFalse(control.camera_enabled)
+
+    @patch("desktop_health_assistant.time.sleep")
+    @patch(
+        "desktop_health_assistant.show_context_aware_health_alert",
+        return_value="custom_popup",
+    )
+    @patch("desktop_health_assistant.initialize_health_popup_host")
+    @patch("desktop_health_assistant.run_with_instance_lock")
+    def test_popup_test_mode_bypasses_monitor_instance_lock(
+        self,
+        lock: Mock,
+        initialize_popup: Mock,
+        show_alert: Mock,
+        sleep: Mock,
+    ) -> None:
+        host = initialize_popup.return_value
+        host.wait_until_shown.return_value = True
+        host.last_window_handle = 1234
+
+        result = main(["--test-health-popup"])
+
+        self.assertEqual(result, 0)
+        show_alert.assert_called_once()
+        host.wait_until_shown.assert_called_once_with(5.0)
+        self.assertEqual(
+            [call.args for call in sleep.call_args_list],
+            [(5.0,), (16.0,)],
+        )
+        lock.assert_not_called()
 
 
 if __name__ == "__main__":
